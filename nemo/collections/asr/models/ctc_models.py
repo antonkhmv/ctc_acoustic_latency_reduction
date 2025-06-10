@@ -13,10 +13,11 @@
 # limitations under the License.
 import copy
 import os
-from math import ceil
-from typing import Any, Dict, List, Optional, Union
+from math import ceil, floor
+from typing import Any, Dict, List, Optional, Union, Iterable
 
 import numpy as np
+import random
 import torch
 from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -42,8 +43,496 @@ from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.classes.mixins import AccessMixin
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, LogprobsType, NeuralType, SpectrogramType
 from nemo.utils import logging
+from numba import jit
+
 
 __all__ = ['EncDecCTCModel']
+
+
+
+
+
+@jit(nopython=True)
+def numba_calculate_expected_delays(log_probs, input_lengths, blank_id):
+    """
+    Compute expected first and last blank occurrence time using Numba.
+    """
+    B, _, _ = log_probs.shape
+    head_latency = np.zeros(B, dtype=np.float32)
+    tail_latency = np.zeros(B, dtype=np.float32)
+    
+    for b in range(B):
+        length = input_lengths[b]
+        log_blank = log_probs[b, :, blank_id]
+        log_non_blank = np.log(1 - np.exp(log_blank))
+        log_blank_sum = 0.0
+    
+        for t in range(length):
+            log_prob_first_blank = log_non_blank[t] + log_blank_sum
+            head_latency[b] += t * np.exp(log_prob_first_blank)
+            log_blank_sum += log_blank[t]
+
+        log_blank_sum = 0.0
+        for t in range(length - 1, -1, -1):
+            log_prob_first_blank = log_non_blank[t] + log_blank_sum
+            tail_latency[b] += t * np.exp(log_prob_first_blank)
+            log_blank_sum += log_blank[t]
+
+    return head_latency, tail_latency
+
+
+class TrimTail:
+    def __init__(
+        self,
+        t_min_sec: float = 0.010,
+        t_max_sec: float = 1.000,
+        frame_size: float = 0.010,
+    ):
+        self.t_min = round(t_min_sec / frame_size)
+        self.t_max = round(t_max_sec / frame_size)
+
+    def __call__(self, processed_signal, processed_signal_length):
+        """
+        Args:
+            processed_signal: Tensor (B, D, T)
+            processed_signal_length: Tensor (B,)
+        Returns:
+            Trimmed processed_signal and updated processed_signal_length
+        """
+        B, _, T = processed_signal.shape
+        device = processed_signal.device
+
+        # Sample random t ∼ U(Tmin, Tmax)
+        t = torch.randint(
+            low=self.t_min, high=self.t_max + 1, size=(B,), device=device
+        )
+
+        # Compute new length = length - t (only where t < length / 2)
+        new_lengths = torch.where(
+            condition=t < (processed_signal_length / 2), 
+            input=processed_signal_length - t,
+            other=processed_signal_length
+        )
+
+        indicies = torch.arange(T, device=device)[None, None, :]
+        lengths = new_lengths[:, None, None]
+
+        # Apply TrimTail with masked_fill
+        processed_signal = processed_signal.masked_fill_(indicies >= lengths, 0.0)
+
+        return processed_signal, new_lengths
+
+
+# Custom hyperbolic interpolation
+def hyperbolic_interp(w0, w1, num_steps, steepness=5.0, flip=False):
+    t = np.linspace(0, 1, num_steps)
+    curve = 1 / (1 + steepness * (1 - t)) if flip else 1 / (1 + steepness * t)
+    curve = (curve - curve[-1]) / (curve[0] - curve[-1])  # normalize to [0, 1]
+    return w1 + (w0 - w1) * curve
+
+class AWP:
+    """ 
+    Align with purpose implementation 
+    Source: https://arxiv.org/pdf/2307.01715v3
+    """
+    def __init__(self,
+                num_samples: int,
+                loss_weights: float,
+                loss_weight_steps: list,
+                lambda_bias: float,
+                blank_id: int,
+                add_positional_bias=None, # depriacted
+            ):
+        """
+        Args:
+            num_samples: number of samples in the batch (N)
+            loss_weights: float, array of loss weights 
+            loss_weight_steps: list, steps on which weights from loss_weights ar applied
+            lambda_bias: float, bias for the loss function
+            blank_id: int, index of blank token
+        """
+        super().__init__()
+        self.num_samples = num_samples
+        self.lambda_bias = lambda_bias
+        self._loss_fn = torch.nn.MultiMarginLoss(
+            margin=self.lambda_bias, reduction='mean', 
+        )
+        self.weight = 0.0
+        self.loss_weight_position = 0
+        self.blank_id = blank_id
+        
+        self.loss_weight_steps = []
+        self.loss_weights = []
+
+        assert len(loss_weights) == len(loss_weight_steps), "Mismatch in weights/steps"
+
+        for w_spec, s_spec in zip(loss_weights, loss_weight_steps):
+            if isinstance(w_spec, Iterable) or isinstance(s_spec, Iterable):
+                # interp_type, w0, w1 = w_spec
+                # s0, s1 = s_spec
+                # if s1 <= s0:
+                #     raise ValueError(f"Invalid step range: {s_spec}")
+                # steps = list(range(s0, s1 + 1))
+                # if interp_type == 'lininterp':
+                #     weights = np.linspace(w0, w1, len(steps)).tolist()
+                # elif interp_type == 'loginterp':
+                #     weights = np.logspace(np.log10(w0), np.log10(w1), len(steps)).tolist()
+                # elif interp_type == 'sine':
+                #     t = np.linspace(0, np.pi, len(steps))
+                #     curve = 0.5 * (1 + np.cos(t))  # symmetric decay from 1 to 0
+                #     weights = (w1 + (w0 - w1) * curve).tolist()
+                # else:
+                #     raise ValueError(f"Unknown interp type: {interp_type}")
+                interp_type, w0, w1 = w_spec[:3]
+                s0, s1 = s_spec
+                if s1 <= s0:
+                    raise ValueError(f"Invalid step range: {s_spec}")
+                steps = list(range(s0, s1 + 1))
+
+                if interp_type == 'lininterp':
+                    weights = np.linspace(w0, w1, len(steps)).tolist()
+                elif interp_type == 'loginterp':
+                    weights = np.logspace(np.log10(w0), np.log10(w1), len(steps)).tolist()
+                elif interp_type == 'sine':
+                    t = np.linspace(0, np.pi, len(steps))
+                    curve = 0.5 * (1 + np.cos(t))  # symmetric decay from 1 to 0
+                    weights = (w1 + (w0 - w1) * curve).tolist()
+                elif interp_type == 'hyperbolic':
+                    weights = hyperbolic_interp(w0, w1, len(steps), w_spec[3], flip=False)
+                elif interp_type == 'hyperbolic_flip':
+                    weights = hyperbolic_interp(w0, w1, len(steps), w_spec[3], flip=True)
+                else:
+                    raise ValueError(f"Unknown interp type: {interp_type}")
+                
+                assert len(steps) == len(weights)
+                self.loss_weight_steps.extend(steps)
+                self.loss_weights.extend(weights)
+            else:
+                self.loss_weight_steps.append(s_spec)
+                self.loss_weights.append(float(w_spec))
+
+        # Just to be safe
+        zipped = sorted(zip(self.loss_weight_steps, self.loss_weights), key=lambda x: x[0])
+        self.loss_weight_steps, self.loss_weights = map(list, zip(*zipped))
+
+    
+    def update_weight(self, global_step):
+        """
+        Update the weight of the awp loss according to schedule
+        """
+        while self.loss_weight_position < len(self.loss_weight_steps) \
+              and global_step >= self.loss_weight_steps[self.loss_weight_position]:
+            self.weight = self.loss_weights[self.loss_weight_position]
+            # logging.info(f"AWP loss weight updated to {self.weight} at step {global_step}")
+            self.loss_weight_position += 1
+
+
+    def sample_alignments(self, probs):
+        """
+        probs: tensor of shape (B, T, D)
+        alignments: output of size (B, T, N)
+        """
+        B, T, D = probs.shape
+
+        # Sample indices along the D dimension
+        probs_reshaped = probs.reshape(B * T, D)
+        alignments = torch.multinomial(
+            probs_reshaped, num_samples=self.num_samples, replacement=True,
+        )
+        return alignments.reshape(B, T, self.num_samples)
+
+
+    def alignment_logprobability(self, log_probs, alignments, legnth_mask):
+        """
+        log_probs: tensor of shape (B, T, D)
+        alignments: tensor of shape (B, T, N)
+        legnth_mask: tensor of shape (B, T, 1)
+        output: shape (B, N)
+        """
+        alignment_loglikes = torch.gather(log_probs, dim=2, index=alignments)
+        masked_loglikes = alignment_loglikes * legnth_mask.float()
+        # out: shape (B, T, N)
+        return masked_loglikes.sum(dim=1)
+
+
+    @staticmethod
+    def get_length_mask(input_legnths, max_length):
+        """
+        input_lengths: tensor of shape (B)
+        output of size (B, T, 1)
+        """
+        indices = torch.arange(max_length, device=input_legnths.device)
+        return indices[None, :, None] < input_legnths[:, None, None]
+
+
+    def shift_left(self, alignments, input_lengths):
+        """
+        alignments: tensor of shape (B, T, N)
+        input_lengths: tensor of shape (B)
+        output of size (B, T, N) - improved alignments
+        """
+        _, T, _ = alignments.shape
+        # -> [B, T, 1]
+        mask = self.get_length_mask(input_lengths - 1, T)
+
+        # -> [B, T, N]
+        alignments = torch.roll(alignments, shifts=-1, dims=1)
+        alignments = alignments * mask + self.blank_id * (~mask)
+        return alignments
+
+
+    def awp_low_latency(self, alignments, input_lengths):
+        """
+        alignments: tensor of shape (B, T, N); N - num sampled alignments
+        input_lengths: tensor of shape (B)
+        output: tensor of shape (B, T, N) - improved alignments
+        """
+
+        B, T, N = alignments.shape
+        device = alignments.device
+        
+        # -> [T]
+        indices = torch.arange(T, device=device)
+        
+        # -> [B, T, 1]
+        length_mask = indices[None, :, None] < input_lengths[:, None, None]
+        
+        # -> [B, T-1, N]; where the current alignment token is the same as the previous one
+        repeats_mask = alignments[:, 1:, :] == alignments[:, :-1, :]
+        
+        # -> [B, T-1, N]; match both masks and not blank
+        candidates = repeats_mask & length_mask[:, 1:, :] & (alignments[:, 1:, :] != self.blank_id)
+        
+        # -> [B, T-1, N]; punish choices with small positions
+        # if self.add_positional_bias:
+        #     bias = 1 / torch.linspace(1, 1e-3, T-1, device=device)
+        #     candidates = (candidates * bias[None, :, None]) / bias.sum()
+
+        # -> [B, T, N]; pos 0 will be sampled if all else are 0
+        candidates = torch.concat(
+            [torch.full((B, 1, N), 1e-12, device=device), candidates.float()], dim=1
+        )
+
+        # -> [B, N, T]
+        candidates = candidates.transpose(1, 2)
+        
+        # -> [B * N, T]
+        candidates = candidates.reshape(B * N, T)
+        
+        # -> [B * N, 1]
+        selected_positions = torch.multinomial(candidates, num_samples=1)
+        
+        # -> [B, N]
+        selected_positions = selected_positions.reshape(B, N)
+        
+        # -> [B, N];  Don't move if nothing matched.
+        candidate_positions = torch.where(selected_positions == 0, input_lengths[:, None], selected_positions)
+
+        # -> [B, T, N]
+        shifted_alignments = self.shift_left(alignments, input_lengths)
+        mask = indices[None, :, None] < candidate_positions[:, None, :]
+        alignments = alignments * mask + shifted_alignments * (~mask)
+        return alignments
+
+
+    def shift_alignments(self, alignments: torch.Tensor, shifts: torch.Tensor) -> torch.Tensor:
+        """
+        Efficiently shifts alignment values in time based on per-batch and per-alignment shift amounts.
+        Inserts blanks at the front for positive shifts and at the end for negative shifts.
+
+        Args:
+            alignments (torch.Tensor): [B, T, N] tensor
+            shifts (torch.Tensor): [B, N] tensor with int values
+            blank_id (int): ID representing a blank token
+
+        Returns:
+            torch.Tensor: Shifted alignments of shape [B, T, N]
+        """
+        B, T, N = alignments.shape
+        device = alignments.device
+
+        time = torch.arange(T, device=device).view(1, T, 1).expand(B, T, N)
+        shifts_expanded = shifts.view(B, 1, N).expand(B, T, N)
+
+        # Shifted indices
+        shifted_time = (time - shifts_expanded) % T
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, T, N)
+        feat_idx = torch.arange(N, device=device).view(1, 1, N).expand(B, T, N)
+
+        result = alignments[batch_idx, shifted_time, feat_idx]
+
+        # Mask for padding
+        result.masked_fill_((shifts_expanded > 0) & (time < shifts_expanded), self.blank_id)
+        result.masked_fill_((shifts_expanded < 0) & (time >= T + shifts_expanded), self.blank_id)
+        # result = alignments
+        return result
+
+
+    def align_to_timings(self, alignments, input_lengths, start, end):
+        """
+        alignments: tensor of shape (B, T, N); N - num sampled alignments
+        input_lengths: tensor of shape (B)
+        output: tensor of shape (B, T, N) - improved alignments
+        start: tensor of shape (B)
+        end: tensor of shape (B)
+        """
+
+        B, T, N = alignments.shape
+        device = alignments.device
+
+        # mask of non-blank tokens: shape [B, T]
+        non_blank_mask = (alignments != self.blank_id)
+
+        # -> [T]
+        time = torch.arange(T, device=device).view(1, T, 1).expand(B, T, N)
+
+        # -> [B, N]
+        first_non_blank = torch.where(
+            non_blank_mask, time, torch.full_like(alignments, T)
+        ).min(dim=1).values
+
+        # -> [B, N]
+        shifts = torch.where(first_non_blank < start.view(B, 1).expand(B, N), 1, 0)
+        
+        # -> [B, N]
+        last_non_blank = torch.where(
+            non_blank_mask, time, torch.full_like(alignments, -1)
+        ).max(dim=1).values
+
+        # -> [B, N]
+        shifts = torch.where(last_non_blank > end.view(B, 1).expand(B, N), -1, shifts)
+
+        return self.shift_alignments(alignments, shifts)
+        
+        
+
+    def get_loss(self, log_probs, alignments, input_lengths, starts=None, ends=None):
+        """
+        log_probs: tensor of shape (B, T, D)
+        alignments: tensor of shape (B, T, N)
+        input_lengths: tensor of shape (B)
+        output of size ()
+        """
+
+        if starts is not None:
+            # -> [B, T, N]
+            improved_alignments = self.align_to_timings(alignments, input_lengths, starts, ends)
+        else:
+            # -> [B, T, N]
+            improved_alignments = self.awp_low_latency(alignments, input_lengths)
+
+        # -> [B, T, 1]
+        mask = self.get_length_mask(input_lengths, log_probs.shape[1])
+
+        # -> [B, N]
+        alignment_proba = self.alignment_logprobability(log_probs, alignments, mask)
+
+        # -> [B, N]
+        improved_alignment_proba = self.alignment_logprobability(log_probs, improved_alignments, mask)
+
+        # -> [B * N, 2]
+        x = torch.stack([alignment_proba.reshape(-1), improved_alignment_proba.reshape(-1)], dim=1)
+        return self.weight * self._loss_fn(x, torch.ones(x.shape[0], device=x.device, dtype=torch.int64))
+
+
+
+def ctc_ce_split(log_probs, starts, ends, lens, blank_id):
+    """
+    Split log_probs into CTC and CE parts.
+    CTC: between `starts` and `ends`
+    CE: all other valid time steps (before `lens`) excluding the CTC region.
+
+    Args:
+        log_probs: Tensor of shape [B, T, D]
+        starts: Tensor of shape [B], start indices (inclusive)
+        ends: Tensor of shape [B], end indices (exclusive)
+        lens: Tensor of shape [B], actual lengths of each sequence
+
+    Returns:
+        ctc_log_probs: [B, T_ctc, D]
+        ctc_lens: [B]
+        ce_log_probs: [N_ce, D] (flattened valid CE entries only)
+        ce_lens: [B]
+    """
+    B, T, D = log_probs.shape
+    device = log_probs.device
+
+    # [1, T]
+    positions = torch.arange(T, device=device).unsqueeze(0)
+
+    # [B, T] - boolean masks
+    ctc_mask = (positions >= starts[:, None]) & (positions < ends[:, None])
+    ce_mask = (~ctc_mask) & (positions < lens[:, None])
+
+    # [B] - counts of valid positions
+    ctc_lens = ctc_mask.sum(dim=1)
+    ce_lens = ce_mask.sum(dim=1)
+
+    # ---- CTC ----
+    ctc_pos = torch.cumsum(ctc_mask, dim=1) - 1
+    non_ctc_pos = torch.cumsum(~ctc_mask, dim=1) - 1
+    ctc_index = torch.where(ctc_mask, ctc_pos, non_ctc_pos + ctc_lens[:, None])
+    
+    # Expand into 3 dimesions to avoid a bug in torch.scatter
+    ctc_index = ctc_index.unsqueeze(-1).expand(-1, -1, D)
+    ctc_logprobs = torch.zeros_like(log_probs).scatter(1, ctc_index, log_probs)
+    ctc_logprobs = ctc_logprobs[:, :ctc_lens.max()]
+
+    # ---- CE ----
+    # [N_ce, D] — gather only valid CE positions
+    ce_logprobs = log_probs[ce_mask]
+    
+    # Use blank targets as dummy supervision (CE as auxiliary regularizer)
+    # [N_ce]
+    ce_targets = torch.full(
+        (ce_logprobs.shape[0],),
+        fill_value=blank_id,
+        dtype=lens.dtype,
+        device=device,
+    )
+    return ctc_logprobs, ctc_lens, ce_logprobs, ce_lens, ce_targets
+
+
+
+class TimingAugmentor:
+    def __init__(self,
+                 offset: float,
+                 min_left_margin_sec: float,
+                 max_left_margin_sec: float,
+                 min_right_margin_sec: float,
+                 max_right_margin_sec: float,
+                 frame_size: float
+                 ):
+        self.offset = offset
+        self.min_left_margin_sec = min_left_margin_sec
+        self.max_left_margin_sec = max_left_margin_sec
+        self.min_right_margin_sec = min_right_margin_sec
+        self.max_right_margin_sec = max_right_margin_sec
+        self.frame_size = frame_size
+
+    def _sample_time(self, t_min, t_max, size, device):
+        if abs(t_min - t_max) < 1e-12:
+            return torch.full(size, round(t_min / self.frame_size), device=device)
+        else:
+            return torch.randint(
+                low=floor(t_min / self.frame_size), high=ceil(t_max / self.frame_size) + 1, size=size, device=device
+            )
+
+    def __call__(self, starts, ends, lens):
+        left_margin_sec = self._sample_time(
+            self.min_left_margin_sec, self.max_left_margin_sec, size=starts.shape, device=starts.device
+        )
+        right_margin_sec = self._sample_time(
+            self.min_right_margin_sec, self.max_right_margin_sec, size=ends.shape, device=ends.device
+        )
+        zeros = 0 * lens
+        starts = torch.clip(
+            ((self.offset + starts) / self.frame_size).floor() - left_margin_sec, zeros, lens
+        )
+        ends = torch.clip(
+            ((self.offset + ends) / self.frame_size).ceil() + right_margin_sec, zeros, lens
+        )
+        return starts, ends
 
 
 class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMixin, ASRTranscriptionMixin):
@@ -59,6 +548,18 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         super().__init__(cfg=cfg, trainer=trainer)
         self.preprocessor = EncDecCTCModel.from_config_dict(self._cfg.preprocessor)
         self.encoder = EncDecCTCModel.from_config_dict(self._cfg.encoder)
+    
+        # Mel spectrogram -> 10ms / frame
+        # Subsampling -> 40ms / frame
+
+        # Frame size of the output ~ 40ms; 
+        # Frame size of the input (for processed signal) ~ 10ms
+
+        self.out_frame_size_in_sec = (
+            self._cfg.preprocessor.window_stride * self._cfg.encoder.subsampling_factor
+        )
+        
+        logging.info(f"Model frame size in seconds is {self.out_frame_size_in_sec=}")
 
         with open_dict(self._cfg):
             if "feat_in" not in self._cfg.decoder or (
@@ -83,6 +584,52 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             zero_infinity=True,
             reduction=self._cfg.get("ctc_reduction", "mean_batch"),
         )
+        
+        self.ce_weight = None
+        self.ce_loss = torch.nn.CrossEntropyLoss()
+
+        self.blank_id = self.decoder.num_classes_with_blank - 1
+
+        self.train_with_timings = None
+        self.timing_augmentor = None
+
+        if "train_with_timings" in self._cfg:
+            self.train_with_timings = self._cfg.train_with_timings
+            with open_dict(self._cfg):
+                if "method" not in self.train_with_timings:
+                    self.train_with_timings["method"] = None
+
+            timing_augmentor_cfg = {}
+
+            if "timing_augmentor" in self.train_with_timings:
+                timing_augmentor_cfg = self.train_with_timings.timing_augmentor
+
+            self.timing_augmentor = TimingAugmentor(
+                offset=self._cfg.train_ds.left_pad_signal_ms * 1e-3,
+                min_left_margin_sec=timing_augmentor_cfg.get("min_left_margin_sec", 0),
+                max_left_margin_sec=timing_augmentor_cfg.get("max_left_margin_sec", 0),
+                min_right_margin_sec=timing_augmentor_cfg.get("min_right_margin_sec", 0),
+                max_right_margin_sec=timing_augmentor_cfg.get("max_right_margin_sec", 0),
+                frame_size=self.out_frame_size_in_sec,
+            )
+
+        # Latency reduction methods:
+        if 'awp' in self._cfg:
+            kwargs = OmegaConf.to_container(self._cfg.awp)
+            assert 'blank_id' not in kwargs, "blank_id is set automatically"
+            logging.info(f"Using AWP with kwargs: {kwargs}")
+            self.awp = AWP(blank_id=self.blank_id, **kwargs)
+        else:
+            self.awp = None
+
+        if 'trimtail' in self._cfg:
+            tcfg = self._cfg.trimtail
+            logging.info(f"Using TrimTail with Tmin={tcfg.tmin_sec}, Tmax={tcfg.tmax_sec}")
+            self.trimtail = TrimTail(
+                t_min_sec=tcfg.tmin_sec, t_max_sec=tcfg.tmax_sec, frame_size=self._cfg.preprocessor.window_stride,
+            )
+        else:
+            self.trimtail = None
 
         if hasattr(self._cfg, 'spec_augment') and self._cfg.spec_augment is not None:
             self.spec_augmentation = EncDecCTCModel.from_config_dict(self._cfg.spec_augment)
@@ -532,6 +1079,9 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
 
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+            
+        if self.trimtail is not None and self.training:
+            processed_signal, processed_signal_length = self.trimtail(processed_signal=processed_signal, processed_signal_length=processed_signal_length)
 
         encoder_output = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         encoded = encoder_output[0]
@@ -552,9 +1102,15 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             AccessMixin.reset_registry(self)
 
         if self.is_interctc_enabled():
-            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
-
-        signal, signal_len, transcript, transcript_len = batch
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid) 
+        
+        starts, ends = None, None 
+        
+        if len(batch) == 4:
+            signal, signal_len, transcript, transcript_len = batch
+        elif len(batch) == 6:
+            signal, signal_len, transcript, transcript_len, starts, ends = batch
+        
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             log_probs, encoded_len, predictions = self.forward(
                 processed_signal=signal, processed_signal_length=signal_len
@@ -567,9 +1123,89 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         else:
             log_every_n_steps = 1
 
-        loss_value = self.loss(
-            log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
-        )
+        
+        
+        if self.train_with_timings is not None:
+
+            starts, ends = self.timing_augmentor(starts, ends, encoded_len)
+            
+            # if random.randint(0, 100) == 0:
+            #     logging.info(
+            #         f"starts: {[s * self.out_frame_size_in_sec for s in starts.cpu().numpy().tolist()]}\n" + f"ends: {[s * self.out_frame_size_in_sec for s in (encoded_len - ends).cpu().numpy().tolist()]}"
+            #     )
+            
+            if self.train_with_timings.method == "cross_entropy":
+                
+                # Perform the logprob split
+                ctc_logprobs, ctc_lens, ce_logprobs, ce_lens, ce_targets = ctc_ce_split(log_probs, starts, ends, encoded_len, self.blank_id)
+
+                # Compute CTC loss on ctc_logprobs
+                loss_value = self.loss(
+                    log_probs=ctc_logprobs,
+                    targets=transcript,
+                    input_lengths=ctc_lens,
+                    target_lengths=transcript_len,
+                )
+
+                # Compute CE loss if there are valid CE positions
+                if (ce_logprobs.shape[0] > 0):
+                    
+                    # Repeat each value `a[i]` times
+                    # Example: [1, 0, 3, 2] -> [1, 3, 3, 3, 2, 2]
+                    # [N_ce]
+                    ce_norm = ce_lens.repeat_interleave(ce_lens)
+                    
+                    # [N_ce, D]
+                    ce_loss = torch.nn.functional.cross_entropy(
+                        ce_logprobs, ce_targets, reduction="none"
+                    )
+
+                    # []
+                    ce_loss = (ce_loss / ce_norm).sum() / log_probs.shape[0]
+
+                    loss_value += ce_loss * self.ce_weight
+
+            # elif self.train_with_timings.method == "early_late_pentalties":
+                
+            #     T = log_probs.shape[1]
+                
+            #     alpha = 1e-3
+            #     t_buffer = 0.040
+                
+            #     eos_id = self.eos_id
+                
+            #     pos = torch.arange(0, T, device=encoded_len.device)
+                
+            #     early_penalty = torch.maximum(0, (ends / self.out_frame_size_in_sec).ceil() - pos)
+            #     late_penalty = torch.maximum(0, pos - ((ends + t_buffer) / self.out_frame_size_in_sec).ceil())
+                
+            #     # [B, T, D]
+            #     log_probs[:, :, eos_id] -= early_penalty * alpha
+            #     log_probs[:, :, eos_id] -= late_penalty * alpha
+                
+            #     # Compute CTC loss on ctc_logprobs
+            #     loss_value = self.loss(
+            #         log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            #     )
+
+            # else:
+            #     raise NotImplementedError(f"Unknown train_with_timings.method: {self.train_with_timings.method}")
+            else:
+                loss_value = self.loss(
+                    log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+                )
+        else:
+            loss_value = self.loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+
+        if self.awp is not None:
+            probs = log_probs.exp()
+            self.awp.update_weight(global_step=self.trainer.global_step)
+            alignments = self.awp.sample_alignments(probs)
+            loss_value += self.awp.get_loss(
+                log_probs=log_probs, alignments=alignments, input_lengths=encoded_len, starts=starts, ends=ends
+            )
 
         # Add auxiliary losses, if registered
         loss_value = self.add_auxiliary_losses(loss_value)
@@ -626,7 +1262,16 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        signal, signal_len, transcript, transcript_len = batch
+        # signal, signal_len, transcript, transcript_len = batch
+        starts, ends = None, None
+        
+        if len(batch) == 4:
+            signal, signal_len, transcript, transcript_len = batch
+
+        elif len(batch) == 6:
+            signal, signal_len, transcript, transcript_len, starts, ends = batch
+
+
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
             log_probs, encoded_len, predictions = self.forward(
                 processed_signal=signal, processed_signal_length=signal_len
@@ -657,6 +1302,42 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
         metrics.update({'val_loss': loss_value, 'val_wer_num': wer_num, 'val_wer_denom': wer_denom, 'val_wer': wer})
 
         self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+
+        head_delay, tail_delay = numba_calculate_expected_delays(
+            log_probs.detach().cpu().numpy(), input_lengths=encoded_len.cpu().numpy(), blank_id=self.blank_id
+        )
+
+        metrics.update({
+            "head_nonblank_delay_sec": torch.tensor(self.out_frame_size_in_sec * head_delay, dtype=torch.float32, device=loss_value.device),
+            "tail_nonblank_delay_sec": torch.tensor(self.out_frame_size_in_sec * tail_delay, dtype=torch.float32, device=loss_value.device),
+        })
+        
+        if starts is not None:
+            
+            # # log starts, ends and head_delay and tail_delay
+            
+            # # 1. log starts
+            # logging.info(
+            #     f"starts: {[s for s in starts.tolist()]}\n"
+            # )
+            # logging.info(
+            #     f"ends: {[e for e in ends.tolist()]}\n"
+            # )
+            # logging.info(
+            #     f"head_delay: {[self.out_frame_size_in_sec * d for d in head_delay.tolist()]}\n"
+            # )
+            # logging.info(
+            #     f"tail_delay: {[self.out_frame_size_in_sec * d for d in tail_delay.tolist()]}\n"
+            # )
+            
+            offset = self._cfg.test_ds.left_pad_signal_ms * 1e-3
+            starts = offset + starts.cpu().numpy()
+            ends = offset + ends.cpu().numpy()
+
+            metrics.update({
+                "start_diff": torch.tensor(self.out_frame_size_in_sec * head_delay - starts, dtype=torch.float32, device=loss_value.device),
+                "end_diff": torch.tensor(self.out_frame_size_in_sec * tail_delay - ends, dtype=torch.float32, device=loss_value.device),
+            })
 
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -781,6 +1462,8 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
             'pin_memory': True,
             'channel_selector': config.get('channel_selector', None),
+            'left_pad_signal_ms': config.get('left_pad_signal_ms', None),
+            'right_pad_signal_ms': config.get('right_pad_signal_ms', None),
         }
         if config.get("augmentor"):
             dl_config['augmentor'] = config.get("augmentor")
